@@ -3,5 +3,11 @@ display_name: 消息推送桥接
 short_desc: 通过 HTTP API 将外部平台消息推送到 AstrBot 指定的群聊/私聊。
 desc: 在插件内启动一个带 Token 鉴权的 HTTP API 服务，外部平台（Telegram、网页、脚本、监控告警等）调用该接口即可把消息实时推送到 AstrBot 所接入的任意会话（QQ 群、私聊、微信、Telegram 等）。支持原始转发 / AI 解析两种互斥模式、别名绑定目标会话、文本与图片推送、绑定持久化。
 version: v1.1.0
-author: CodeBuddy
+author: xq5564
 repo: https://github.com/xq5564/astrbot_plugin_msgpush
+social_link: https://github.com/xq5564
+tags:
+  - 消息推送
+  - 通知
+  - 跨平台
+  - webhook
