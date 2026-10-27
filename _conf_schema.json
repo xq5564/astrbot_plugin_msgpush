@@ -1,0 +1,47 @@
+{
+  "mode": {
+    "description": "推送处理模式（两种模式互斥）",
+    "type": "string",
+    "options": ["raw", "parse"],
+    "default": "raw",
+    "hint": "raw=原始模式：原文直接转发到会话；parse=解析模式：原文交给会话的 AI 上下文解析后发出结果"
+  },
+  "default_source": {
+    "description": "推送消息的默认来源标签（外部接口未传 source 时使用）",
+    "type": "string",
+    "default": "外部"
+  },
+  "parse_prompt": {
+    "description": "解析模式的附加提示词，指导 AI 如何处理推送内容",
+    "type": "text",
+    "default": "你收到了一条来自其他平台推送的消息。请结合当前对话上下文理解并解析这条推送内容，给出简洁、有帮助的回应；如推送中包含需要提醒用户的重要信息，请明确指出。"
+  },
+  "host": {
+    "description": "HTTP 推送服务监听地址（0.0.0.0 对外开放，127.0.0.1 仅本机）",
+    "type": "string",
+    "default": "0.0.0.0",
+    "hint": "如果只需本机脚本调用，建议改为 127.0.0.1 更安全"
+  },
+  "port": {
+    "description": "HTTP 推送服务端口",
+    "type": "int",
+    "default": 6199
+  },
+  "token": {
+    "description": "推送接口鉴权 Token",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "留空将自动生成随机 Token 并写入配置，可在 WebUI 插件配置中查看"
+  },
+  "push_prefix": {
+    "description": "推送消息的统一前缀（如 [外部推送] ）",
+    "type": "string",
+    "default": ""
+  },
+  "max_image_size_mb": {
+    "description": "单张推送图片的最大体积（MB），超过则跳过",
+    "type": "int",
+    "default": 20
+  }
+}
