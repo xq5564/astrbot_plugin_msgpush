@@ -47,6 +47,7 @@ UMO_PATTERN = re.compile(r"^[\w.\-]+:[\w.\-]+:.+")
 
 MODE_RAW = "raw"
 MODE_PARSE = "parse"
+PLUGIN_VERSION = "1.1.3"
 
 
 @register(
@@ -54,7 +55,7 @@ MODE_PARSE = "parse"
     "CodeBuddy",
     "通过内置 HTTP API 将外部平台的消息推送到 AstrBot 指定会话。"
     "支持原始转发 / AI 解析两种互斥模式、别名绑定、文本与图片。",
-    "1.1.0",
+    PLUGIN_VERSION,
 )
 class MsgPushPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -166,7 +167,7 @@ class MsgPushPlugin(Star):
         return web.json_response(
             {
                 "plugin": "astrbot_plugin_msgpush",
-                "version": "1.1.0",
+                "version": PLUGIN_VERSION,
                 "mode": self._mode(),
                 "endpoints": [
                     "POST /push/send",
