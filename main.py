@@ -275,10 +275,10 @@ class MsgPushPlugin(Star):
         mode = self._mode()
         try:
             if mode == MODE_PARSE:
-                result = await self._parse_and_push(umo, formatted, images)
+                result, fallback = await self._parse_and_push(umo, formatted, images)
                 return web.json_response(
                     {"ok": True, "mode": MODE_PARSE, "target": target, "umo": umo,
-                     "result": result}
+                     "fallback": fallback, "result": result}
                 )
             else:
                 await self._push(umo, formatted, images)
@@ -366,9 +366,32 @@ class MsgPushPlugin(Star):
     # 解析模式：交给目标会话的 LLM 上下文解析
     # ------------------------------------------------------------------
 
-    async def _parse_and_push(self, umo: str, prompt_text: str, images: list) -> str:
+    async def _parse_and_push(
+        self, umo: str, prompt_text: str, images: list
+    ) -> tuple[str, bool]:
         """解析模式：加载目标会话的 LLM 上下文与人格，请求 LLM，发送解析结果，
-        并尽量把这一轮对话写回该会话的历史。返回 AI 的回复文本。"""
+        并尽量把这一轮对话写回该会话的历史。
+
+        返回 (发送的文本, 是否因解析失败降级为原始转发)。
+        """
+        try:
+            result = await self._llm_parse(umo, prompt_text, images)
+        except Exception as e:
+            # 解析失败时按配置降级为原始转发，保证推送消息不丢失
+            if bool(self.config.get("parse_fallback_raw", True)):
+                logger.warning(f"[msgpush] 解析失败，降级为原始转发: {e}")
+                await self._push(umo, prompt_text, images)
+                return prompt_text, True
+            raise
+
+        # 发送解析结果到会话
+        prefix = str(self.config.get("push_prefix", "") or "")
+        chain = MessageChain().message((prefix + result).strip())
+        await self.context.send_message(umo, chain)
+        return result, False
+
+    async def _llm_parse(self, umo: str, prompt_text: str, images: list) -> str:
+        """调用目标会话所属的 LLM 完成解析，返回 AI 回复文本。"""
         provider = self.context.get_using_provider()
         if provider is None:
             raise RuntimeError("AstrBot 未配置任何 LLM 提供商，无法使用解析模式")
@@ -394,9 +417,7 @@ class MsgPushPlugin(Star):
                             history = None
                     if isinstance(history, list) and history:
                         contexts = history
-                        history_is_dict = bool(
-                            isinstance(history[0], dict)
-                        )
+                        history_is_dict = bool(isinstance(history[0], dict))
                     # 会话人格的 system_prompt
                     try:
                         persona_id = getattr(convo, "persona_id", None)
@@ -414,10 +435,14 @@ class MsgPushPlugin(Star):
         # 2. 附加解析模式提示词
         extra = str(self.config.get("parse_prompt", "") or "").strip()
         if extra:
-            system_prompt = f"{system_prompt}\n\n{extra}".strip() if system_prompt else extra
+            system_prompt = (
+                f"{system_prompt}\n\n{extra}".strip() if system_prompt else extra
+            )
 
         # 3. 请求 LLM（图片交给多模态模型解析）
-        image_urls = [u for u in images if u.lower().startswith(("http://", "https://"))]
+        image_urls = [
+            u for u in images if u.lower().startswith(("http://", "https://"))
+        ]
         resp = await provider.text_chat(
             prompt=prompt_text,
             contexts=contexts,
@@ -426,14 +451,9 @@ class MsgPushPlugin(Star):
         )
         result = self._extract_llm_text(resp)
         if not result:
-            raise RuntimeError("LLM 返回了空结果")
+            raise RuntimeError(self._describe_empty_response(resp))
 
-        # 4. 发送解析结果到会话
-        prefix = str(self.config.get("push_prefix", "") or "")
-        chain = MessageChain().message((prefix + result).strip())
-        await self.context.send_message(umo, chain)
-
-        # 5. 尽力把本轮对话写回会话历史（保持 AI 上下文连续）
+        # 4. 尽力把本轮对话写回会话历史（保持 AI 上下文连续）
         #    仅当历史本身是 OpenAI dict 格式时才追加，避免破坏内部结构
         try:
             if conv_mgr and cid and history_is_dict:
@@ -446,25 +466,81 @@ class MsgPushPlugin(Star):
 
         return result
 
+    def _describe_empty_response(self, resp) -> str:
+        """构造 LLM 空回复时的诊断信息，便于定位问题"""
+        detail = f"role={getattr(resp, 'role', '?')}"
+        rc = getattr(resp, "reasoning_content", None)
+        if isinstance(rc, str) and rc.strip():
+            detail += f", reasoning_length={len(rc)}"
+        chain = getattr(resp, "result_chain", None)
+        if chain is not None:
+            try:
+                detail += f", chain_size={len(getattr(chain, 'chain', []) or [])}"
+            except Exception:
+                pass
+        raw = getattr(resp, "raw_completion", None)
+        if raw is not None:
+            try:
+                choices = getattr(raw, "choices", None)
+                if choices:
+                    msg = getattr(choices[0], "message", None)
+                    finish = getattr(choices[0], "finish_reason", None)
+                    content = getattr(msg, "content", None)
+                    detail += f", finish_reason={finish}, content_type={type(content).__name__}"
+                    if isinstance(content, str) and content.strip():
+                        detail += f", content_head={content.strip()[:120]}"
+            except Exception:
+                pass
+        return f"LLM 返回空结果({detail})"
+
     @staticmethod
     def _extract_llm_text(resp) -> str:
         """兼容不同版本 LLMResponse 的文本提取"""
-        for attr in ("completion_text", "result_text"):
-            v = getattr(resp, attr, None)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
+        # 1) result_chain（新版主路径）
         chain = getattr(resp, "result_chain", None)
-        if chain:
+        if chain is not None:
+            try:
+                text = chain.get_plain_text()
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+            except Exception:
+                pass
             parts = []
             try:
-                for seg in chain:
-                    t = getattr(seg, "text", None)
-                    if isinstance(t, str):
+                for comp in getattr(chain, "chain", []) or []:
+                    t = getattr(comp, "text", None)
+                    if isinstance(t, str) and t.strip():
                         parts.append(t)
             except Exception:
                 pass
             if parts:
-                return "\n".join(p for p in parts if p.strip()).strip()
+                return "\n".join(parts).strip()
+
+        # 2) completion_text 等文本属性
+        for attr in ("completion_text", "result_text", "_completion_text"):
+            try:
+                v = getattr(resp, attr, None)
+            except Exception:
+                v = None
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+
+        # 3) 推理内容兜底
+        rc = getattr(resp, "reasoning_content", None)
+        if isinstance(rc, str) and rc.strip():
+            return rc.strip()
+
+        # 4) 原始响应兜底
+        raw = getattr(resp, "raw_completion", None)
+        try:
+            choices = getattr(raw, "choices", None)
+            if choices:
+                content = getattr(getattr(choices[0], "message", None), "content", None)
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+        except Exception:
+            pass
+
         return ""
 
     async def _materialize_image(self, src: str) -> Optional[Path]:
@@ -599,10 +675,15 @@ class MsgPushPlugin(Star):
         formatted = f"[测试]推送\n{text}"
         try:
             if self._mode() == MODE_PARSE:
-                result = await self._parse_and_push(umo, formatted, [])
-                yield event.plain_result(
-                    f"已按解析模式向 '{alias}' 推送，AI 回复:\n{result[:500]}"
-                )
+                result, fallback = await self._parse_and_push(umo, formatted, [])
+                if fallback:
+                    yield event.plain_result(
+                        f"解析失败，已降级为原始模式向 '{alias}' 转发。请检查 LLM 配置或查看日志。"
+                    )
+                else:
+                    yield event.plain_result(
+                        f"已按解析模式向 '{alias}' 推送，AI 回复:\n{result[:500]}"
+                    )
             else:
                 await self._push(umo, formatted, [])
                 yield event.plain_result(f"已按原始模式向 '{alias}' 发送测试消息，请到对应会话查看。")

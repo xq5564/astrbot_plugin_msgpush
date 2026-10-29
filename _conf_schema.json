@@ -16,6 +16,11 @@
     "type": "text",
     "default": "你收到了一条来自其他平台推送的消息。请结合当前对话上下文理解并解析这条推送内容，给出简洁、有帮助的回应；如推送中包含需要提醒用户的重要信息，请明确指出。"
   },
+  "parse_fallback_raw": {
+    "description": "解析失败时自动降级为原始转发（避免消息丢失）",
+    "type": "bool",
+    "default": true
+  },
   "host": {
     "description": "HTTP 推送服务监听地址（0.0.0.0 对外开放，127.0.0.1 仅本机）",
     "type": "string",
