@@ -45,9 +45,12 @@ TMP_DIR = DATA_DIR / "tmp"
 # umo 形如 platform:MessageType:session_id，至少包含 2 个冒号
 UMO_PATTERN = re.compile(r"^[\w.\-]+:[\w.\-]+:.+")
 
+# 推送消息头，形如 "[QQ]推送"
+PUSH_HEADER_PATTERN = re.compile(r"^\[[^\]\n]{1,30}\]\s*推送")
+
 MODE_RAW = "raw"
 MODE_PARSE = "parse"
-PLUGIN_VERSION = "1.1.3"
+PLUGIN_VERSION = "1.1.4"
 
 
 @register(
@@ -403,69 +406,111 @@ class MsgPushPlugin(Star):
         cid = None
         history_is_dict = False
 
-        # 1. 加载目标会话的对话历史与人格（尽力而为，失败则无上下文解析）
-        try:
-            conv_mgr = self.context.conversation_manager
-            cid = await conv_mgr.get_curr_conversation_id(umo)
-            if cid:
-                convo = await conv_mgr.get_conversation(umo, cid)
-                if convo:
-                    history = getattr(convo, "history", None)
-                    if isinstance(history, str):
+        # 1. 按配置加载会话历史（默认只取最近若干条，并剔除历史中的推送消息）
+        use_history = bool(self.config.get("parse_use_history", True))
+        if use_history:
+            try:
+                conv_mgr = self.context.conversation_manager
+                cid = await conv_mgr.get_curr_conversation_id(umo)
+                if cid:
+                    convo = await conv_mgr.get_conversation(umo, cid)
+                    if convo:
+                        history = getattr(convo, "history", None)
+                        if isinstance(history, str):
+                            try:
+                                history = json.loads(history)
+                            except Exception:
+                                history = None
+                        if isinstance(history, list) and history:
+                            # 剔除历史里的推送消息，避免 AI 把推送当成聊天上下文继续编故事
+                            cleaned = [
+                                m for m in history if not self._is_push_message(m)
+                            ]
+                            limit = int(self.config.get("parse_history_limit", 6) or 0)
+                            if limit > 0:
+                                cleaned = cleaned[-limit:]
+                            if cleaned:
+                                contexts = cleaned
+                                history_is_dict = isinstance(cleaned[0], dict)
+                        # 会话人格的 system_prompt
                         try:
-                            history = json.loads(history)
+                            persona_id = getattr(convo, "persona_id", None)
+                            pm = getattr(self.context, "persona_manager", None)
+                            if persona_id and pm:
+                                persona = await pm.get_persona(persona_id)
+                                sp = getattr(persona, "system_prompt", None)
+                                if sp:
+                                    system_prompt = sp
                         except Exception:
-                            history = None
-                    if isinstance(history, list) and history:
-                        contexts = history
-                        history_is_dict = bool(isinstance(history[0], dict))
-                    # 会话人格的 system_prompt
-                    try:
-                        persona_id = getattr(convo, "persona_id", None)
-                        pm = getattr(self.context, "persona_manager", None)
-                        if persona_id and pm:
-                            persona = await pm.get_persona(persona_id)
-                            sp = getattr(persona, "system_prompt", None)
-                            if sp:
-                                system_prompt = sp
-                    except Exception:
-                        pass
-        except Exception as e:
-            logger.warning(f"[msgpush] 加载会话上下文失败(将无上下文解析): {e}")
+                            pass
+            except Exception as e:
+                logger.warning(f"[msgpush] 加载会话上下文失败(将无上下文解析): {e}")
 
-        # 2. 附加解析模式提示词
+        # 2. 解析提示词（独立的解析器角色，隔离聊天人设的干扰）
         extra = str(self.config.get("parse_prompt", "") or "").strip()
         if extra:
             system_prompt = (
-                f"{system_prompt}\n\n{extra}".strip() if system_prompt else extra
+                f"{extra}\n\n{system_prompt}".strip() if system_prompt else extra
             )
 
         # 3. 请求 LLM（图片交给多模态模型解析）
         image_urls = [
             u for u in images if u.lower().startswith(("http://", "https://"))
         ]
-        resp = await provider.text_chat(
-            prompt=prompt_text,
-            contexts=contexts,
-            system_prompt=system_prompt,
-            image_urls=image_urls or None,
-        )
+        call_kwargs = {}
+        max_tokens = int(self.config.get("parse_max_tokens", 600) or 0)
+        if max_tokens > 0:
+            call_kwargs["max_tokens"] = max_tokens
+
+        try:
+            resp = await provider.text_chat(
+                prompt=prompt_text,
+                contexts=contexts,
+                system_prompt=system_prompt,
+                image_urls=image_urls or None,
+                **call_kwargs,
+            )
+        except Exception as e:
+            if call_kwargs:
+                # 部分服务商不接受 max_tokens，去掉后重试一次
+                logger.warning(f"[msgpush] 带 max_tokens 请求失败，改为默认参数重试: {e}")
+                resp = await provider.text_chat(
+                    prompt=prompt_text,
+                    contexts=contexts,
+                    system_prompt=system_prompt,
+                    image_urls=image_urls or None,
+                )
+            else:
+                raise
+
         result = self._extract_llm_text(resp)
         if not result:
             raise RuntimeError(self._describe_empty_response(resp))
 
-        # 4. 尽力把本轮对话写回会话历史（保持 AI 上下文连续）
-        #    仅当历史本身是 OpenAI dict 格式时才追加，避免破坏内部结构
-        try:
-            if conv_mgr and cid and history_is_dict:
-                new_history = list(contexts or [])
-                new_history.append({"role": "user", "content": prompt_text})
-                new_history.append({"role": "assistant", "content": result})
-                await conv_mgr.update_conversation(umo, cid, new_history)
-        except Exception as e:
-            logger.warning(f"[msgpush] 写回会话历史失败(不影响本次发送): {e}")
+        # 4. 可选：把本轮对话写回会话历史（默认关闭，避免长期污染日常聊天上下文）
+        if bool(self.config.get("parse_write_history", False)):
+            try:
+                if conv_mgr and cid and history_is_dict:
+                    new_history = list(contexts or [])
+                    new_history.append({"role": "user", "content": prompt_text})
+                    new_history.append({"role": "assistant", "content": result})
+                    await conv_mgr.update_conversation(umo, cid, new_history)
+            except Exception as e:
+                logger.warning(f"[msgpush] 写回会话历史失败(不影响本次发送): {e}")
 
         return result
+
+    @staticmethod
+    def _is_push_message(msg) -> bool:
+        """判断一条历史消息是否为推送消息（[来源]推送 ...），用于过滤上下文污染"""
+        content = None
+        if isinstance(msg, dict):
+            content = msg.get("content")
+        else:
+            content = getattr(msg, "content", None)
+        if isinstance(content, str) and PUSH_HEADER_PATTERN.match(content.strip()):
+            return True
+        return False
 
     def _describe_empty_response(self, resp) -> str:
         """构造 LLM 空回复时的诊断信息，便于定位问题"""

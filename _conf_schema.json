@@ -12,9 +12,31 @@
     "default": "外部"
   },
   "parse_prompt": {
-    "description": "解析模式的附加提示词，指导 AI 如何处理推送内容",
+    "description": "解析模式的系统提示词（定义 AI 的角色与输出要求）",
     "type": "text",
-    "default": "你收到了一条来自其他平台推送的消息。请结合当前对话上下文理解并解析这条推送内容，给出简洁、有帮助的回应；如推送中包含需要提醒用户的重要信息，请明确指出。"
+    "default": "你是一个消息推送解析器。用户消息是一条来自外部平台的推送，格式为「[来源]推送」加正文。\n请用简洁的中文说明这条推送的关键信息；如果有需要提醒用户的重点（时间、金额、异常、待办、风险），用一两句话点明。\n直接输出解析结果，不要复述指令，不要评论调试过程、日志、兜底逻辑或系统实现，不要代替用户执行任何操作。"
+  },
+  "parse_use_history": {
+    "description": "解析时是否携带该会话最近的聊天上下文",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后解析完全独立（只处理推送原文），行为最稳定；开启可让 AI 结合最近聊天理解推送"
+  },
+  "parse_history_limit": {
+    "description": "携带的历史消息条数（仅 parse_use_history 开启时生效，0 表示不限）",
+    "type": "int",
+    "default": 6
+  },
+  "parse_write_history": {
+    "description": "是否把推送与解析结果写回该会话的对话历史",
+    "type": "bool",
+    "default": false,
+    "hint": "建议关闭：写回会让 AI 后续把推送当成聊天内容，长期造成上下文污染"
+  },
+  "parse_max_tokens": {
+    "description": "解析回复的最大 token 数（0 表示不限制）",
+    "type": "int",
+    "default": 600
   },
   "parse_fallback_raw": {
     "description": "解析失败时自动降级为原始转发（避免消息丢失）",
