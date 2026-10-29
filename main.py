@@ -471,7 +471,7 @@ class MsgPushPlugin(Star):
         detail = f"role={getattr(resp, 'role', '?')}"
         rc = getattr(resp, "reasoning_content", None)
         if isinstance(rc, str) and rc.strip():
-            detail += f", reasoning_length={len(rc)}"
+            detail += f", 仅返回思维链({len(rc)}字符)未输出正文(推理模型可能触发了输出长度上限)"
         chain = getattr(resp, "result_chain", None)
         if chain is not None:
             try:
@@ -495,19 +495,26 @@ class MsgPushPlugin(Star):
 
     @staticmethod
     def _extract_llm_text(resp) -> str:
-        """兼容不同版本 LLMResponse 的文本提取"""
-        # 1) result_chain（新版主路径）
+        """提取 LLM 的正文文本。
+
+        重要：必须严格排除思维链（reasoning_content / Think 组件）——
+        推理模型会先输出思考过程，若把它当正文发给用户，
+        就会把英文推理、内部独白直接暴露到群里。
+        """
+
+        def _is_think(comp) -> bool:
+            name = type(comp).__name__.lower()
+            ctype = str(getattr(comp, "type", "") or "").lower()
+            return "think" in name or ctype in ("think", "reasoning")
+
+        # 1) result_chain：只收集非思维链组件的文本
         chain = getattr(resp, "result_chain", None)
         if chain is not None:
-            try:
-                text = chain.get_plain_text()
-                if isinstance(text, str) and text.strip():
-                    return text.strip()
-            except Exception:
-                pass
             parts = []
             try:
                 for comp in getattr(chain, "chain", []) or []:
+                    if _is_think(comp):
+                        continue
                     t = getattr(comp, "text", None)
                     if isinstance(t, str) and t.strip():
                         parts.append(t)
@@ -515,9 +522,16 @@ class MsgPushPlugin(Star):
                 pass
             if parts:
                 return "\n".join(parts).strip()
+            # AstrBot 自带方法通常只拼接 Plain 组件
+            try:
+                text = chain.get_plain_text()
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+            except Exception:
+                pass
 
-        # 2) completion_text 等文本属性
-        for attr in ("completion_text", "result_text", "_completion_text"):
+        # 2) completion_text / result_text（AstrBot 内部已排除 Think）
+        for attr in ("completion_text", "result_text"):
             try:
                 v = getattr(resp, attr, None)
             except Exception:
@@ -525,12 +539,7 @@ class MsgPushPlugin(Star):
             if isinstance(v, str) and v.strip():
                 return v.strip()
 
-        # 3) 推理内容兜底
-        rc = getattr(resp, "reasoning_content", None)
-        if isinstance(rc, str) and rc.strip():
-            return rc.strip()
-
-        # 4) 原始响应兜底
+        # 3) 原始响应里的正文（只取 message.content，绝不取 reasoning_content）
         raw = getattr(resp, "raw_completion", None)
         try:
             choices = getattr(raw, "choices", None)
@@ -541,6 +550,7 @@ class MsgPushPlugin(Star):
         except Exception:
             pass
 
+        # 只有思考、没有正文时返回空，由上层按降级策略处理
         return ""
 
     async def _materialize_image(self, src: str) -> Optional[Path]:
