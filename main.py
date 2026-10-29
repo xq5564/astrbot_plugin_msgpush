@@ -23,6 +23,7 @@ astrbot_plugin_msgpush - 消息推送桥接插件
 """
 
 import asyncio
+import inspect
 import json
 import re
 import secrets
@@ -50,7 +51,7 @@ PUSH_HEADER_PATTERN = re.compile(r"^\[[^\]\n]{1,30}\]\s*推送")
 
 MODE_RAW = "raw"
 MODE_PARSE = "parse"
-PLUGIN_VERSION = "1.1.4"
+PLUGIN_VERSION = "1.1.5"
 
 
 @register(
@@ -129,6 +130,7 @@ class MsgPushPlugin(Star):
         app = web.Application()
         app.router.add_get("/", self._handle_index)
         app.router.add_get("/push/sessions", self._handle_sessions)
+        app.router.add_get("/push/diag", self._handle_diag)
         app.router.add_post("/push/send", self._handle_send)
         app.router.add_post("/push/bind", self._handle_bind)
         app.router.add_post("/push/unbind", self._handle_unbind)
@@ -175,6 +177,7 @@ class MsgPushPlugin(Star):
                 "endpoints": [
                     "POST /push/send",
                     "GET  /push/sessions",
+                    "GET  /push/diag",
                     "POST /push/bind",
                     "POST /push/unbind",
                 ],
@@ -220,6 +223,110 @@ class MsgPushPlugin(Star):
             result["conversations_error"] = str(e)
 
         return web.json_response(result)
+
+    async def _handle_diag(self, request: web.Request) -> web.Response:
+        """诊断端点：返回 provider 信息、text_chat 参数签名、一次探针调用结果、
+        以及目标会话历史概况。用于快速定位解析模式失效的原因。
+
+        用法: GET /push/diag?target=别名&llm=1
+        """
+        if not self._check_auth(request):
+            return self._unauthorized()
+
+        info: dict = {
+            "ok": True,
+            "version": PLUGIN_VERSION,
+            "mode": self._mode(),
+        }
+
+        provider = None
+        try:
+            provider = self.context.get_using_provider()
+        except Exception as e:
+            info["provider_error"] = f"{type(e).__name__}: {e}"
+
+        if provider is None:
+            info["provider"] = None
+            info["hint"] = "AstrBot 未配置可用的 LLM 提供商，或在插件上下文中拿不到默认模型"
+        else:
+            info["provider_class"] = type(provider).__name__
+            try:
+                pconf = getattr(provider, "provider_config", None)
+                model = None
+                if isinstance(pconf, dict):
+                    model = pconf.get("model_config", {}).get("model") or pconf.get("model")
+                    info["provider_id"] = pconf.get("id") or pconf.get("type")
+                else:
+                    model = getattr(getattr(pconf, "model_config", None), "model", None)
+                    info["provider_id"] = getattr(pconf, "id", None)
+                info["model"] = model
+            except Exception as e:
+                info["provider_meta_error"] = str(e)
+
+            # text_chat 的真实参数签名（不同版本差异很大，直接看这里最快）
+            try:
+                sig = inspect.signature(provider.text_chat)
+                info["text_chat_params"] = list(sig.parameters.keys())
+            except Exception as e:
+                info["text_chat_params_error"] = str(e)
+
+            # 探针调用：最小提示词，验证 provider 本身能不能出文本
+            if request.query.get("llm", "1") != "0":
+                probe_prompt = "请只回复两个字：正常"
+                try:
+                    resp = await asyncio.wait_for(
+                        provider.text_chat(prompt=probe_prompt), timeout=90
+                    )
+                    text = self._extract_llm_text(resp)
+                    info["llm_probe"] = {
+                        "ok": bool(text),
+                        "text": text[:200],
+                        "response_type": type(resp).__name__,
+                        "role": str(getattr(resp, "role", "")),
+                    }
+                    if not text:
+                        info["llm_probe"]["detail"] = self._describe_empty_response(resp)
+                        rc = getattr(resp, "reasoning_content", None)
+                        if isinstance(rc, str) and rc.strip():
+                            info["llm_probe"]["reasoning_head"] = rc.strip()[:200]
+                except asyncio.TimeoutError:
+                    info["llm_probe"] = {"ok": False, "error": "探针调用超时(90s)"}
+                except Exception as e:
+                    info["llm_probe"] = {
+                        "ok": False,
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+
+        # 目标会话历史概况
+        target = str(request.query.get("target", "") or "").strip()
+        if target:
+            umo = self._resolve_target(target) or target
+            info["target"] = target
+            info["umo"] = umo
+            try:
+                conv_mgr = self.context.conversation_manager
+                cid = await conv_mgr.get_curr_conversation_id(umo)
+                info["conversation_id"] = cid
+                if cid:
+                    convo = await conv_mgr.get_conversation(umo, cid)
+                    history = getattr(convo, "history", None)
+                    if isinstance(history, str):
+                        try:
+                            history = json.loads(history)
+                        except Exception:
+                            pass
+                    if isinstance(history, list):
+                        info["history_count"] = len(history)
+                        info["history_is_dict"] = bool(
+                            history and isinstance(history[0], dict)
+                        )
+                        info["history_sample"] = [
+                            str(m)[:160] for m in history[-2:]
+                        ]
+            except Exception as e:
+                info["history_error"] = f"{type(e).__name__}: {e}"
+
+        return web.json_response(info)
 
     async def _handle_send(self, request: web.Request) -> web.Response:
         """推送消息: {"target", "content", "source", "images"}"""
@@ -279,11 +386,20 @@ class MsgPushPlugin(Star):
         mode = self._mode()
         try:
             if mode == MODE_PARSE:
-                result, fallback = await self._parse_and_push(umo, formatted, images)
-                return web.json_response(
-                    {"ok": True, "mode": MODE_PARSE, "target": target, "umo": umo,
-                     "fallback": fallback, "result": result}
+                result, fallback, parse_error = await self._parse_and_push(
+                    umo, formatted, images
                 )
+                payload = {
+                    "ok": True,
+                    "mode": MODE_PARSE,
+                    "target": target,
+                    "umo": umo,
+                    "fallback": fallback,
+                    "result": result,
+                }
+                if parse_error:
+                    payload["parse_error"] = parse_error
+                return web.json_response(payload)
             else:
                 await self._push(umo, formatted, images)
                 return web.json_response(
@@ -372,27 +488,27 @@ class MsgPushPlugin(Star):
 
     async def _parse_and_push(
         self, umo: str, prompt_text: str, images: list
-    ) -> tuple[str, bool]:
-        """解析模式：加载目标会话的 LLM 上下文与人格，请求 LLM，发送解析结果，
-        并尽量把这一轮对话写回该会话的历史。
+    ) -> tuple[str, bool, str]:
+        """解析模式：加载目标会话的 LLM 上下文与人格，请求 LLM，发送解析结果。
 
-        返回 (发送的文本, 是否因解析失败降级为原始转发)。
+        返回 (发送的文本, 是否降级为原始转发, 降级原因)。
         """
         try:
             result = await self._llm_parse(umo, prompt_text, images)
         except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            logger.error(f"[msgpush] 解析失败: {err}")
             # 解析失败时按配置降级为原始转发，保证推送消息不丢失
             if bool(self.config.get("parse_fallback_raw", True)):
-                logger.warning(f"[msgpush] 解析失败，降级为原始转发: {e}")
                 await self._push(umo, prompt_text, images)
-                return prompt_text, True
+                return prompt_text, True, err
             raise
 
         # 发送解析结果到会话
         prefix = str(self.config.get("push_prefix", "") or "")
         chain = MessageChain().message((prefix + result).strip())
         await self.context.send_message(umo, chain)
-        return result, False
+        return result, False, ""
 
     async def _llm_parse(self, umo: str, prompt_text: str, images: list) -> str:
         """调用目标会话所属的 LLM 完成解析，返回 AI 回复文本。"""
@@ -454,43 +570,78 @@ class MsgPushPlugin(Star):
             )
 
         # 3. 请求 LLM（图片交给多模态模型解析）
+        #    不同 AstrBot 版本 / 不同模型服务商对参数与历史格式的兼容性差异很大，
+        #    这里按「完整 → 精简」逐级降级重试，并累积每一步的失败原因，
+        #    避免一个不兼容的参数就让整条解析链路失效。
         image_urls = [
             u for u in images if u.lower().startswith(("http://", "https://"))
         ]
-        call_kwargs = {}
-        max_tokens = int(self.config.get("parse_max_tokens", 600) or 0)
-        if max_tokens > 0:
-            call_kwargs["max_tokens"] = max_tokens
+        max_tokens = int(self.config.get("parse_max_tokens", 0) or 0)
 
-        try:
-            resp = await provider.text_chat(
-                prompt=prompt_text,
-                contexts=contexts,
-                system_prompt=system_prompt,
-                image_urls=image_urls or None,
-                **call_kwargs,
+        plan: list[dict] = []
+        if contexts is not None and max_tokens > 0:
+            plan.append(
+                {
+                    "label": "历史+人格+max_tokens",
+                    "contexts": contexts,
+                    "system_prompt": system_prompt,
+                    "max_tokens": max_tokens,
+                }
             )
-        except Exception as e:
-            if call_kwargs:
-                # 部分服务商不接受 max_tokens，去掉后重试一次
-                logger.warning(f"[msgpush] 带 max_tokens 请求失败，改为默认参数重试: {e}")
-                resp = await provider.text_chat(
-                    prompt=prompt_text,
-                    contexts=contexts,
-                    system_prompt=system_prompt,
-                    image_urls=image_urls or None,
-                )
-            else:
-                raise
+        if contexts is not None:
+            plan.append(
+                {"label": "历史+人格", "contexts": contexts, "system_prompt": system_prompt}
+            )
+        plan.append(
+            {"label": "仅提示词(无历史)", "contexts": None, "system_prompt": system_prompt}
+        )
+        plan.append(
+            {"label": "最简调用", "contexts": None, "system_prompt": None}
+        )
 
-        result = self._extract_llm_text(resp)
-        if not result:
-            raise RuntimeError(self._describe_empty_response(resp))
+        attempts: list[str] = []
+        for item in plan:
+            kwargs = {
+                "prompt": prompt_text,
+                "contexts": item["contexts"],
+                "system_prompt": item["system_prompt"],
+                "image_urls": image_urls or None,
+            }
+            if item.get("max_tokens"):
+                kwargs["max_tokens"] = item["max_tokens"]
+            try:
+                resp = await provider.text_chat(**kwargs)
+            except Exception as e:
+                attempts.append(f"[{item['label']}] 异常 {type(e).__name__}: {e}")
+                logger.warning(
+                    f"[msgpush] LLM 调用失败({item['label']}): {type(e).__name__}: {e}"
+                )
+                continue
+
+            text = self._extract_llm_text(resp)
+            if text:
+                if attempts:
+                    logger.info(
+                        f"[msgpush] 解析经降级后成功({item['label']})，"
+                        f"此前失败: {' | '.join(attempts)}"
+                    )
+                # 记录实际生效的历史，供写回逻辑使用
+                if item["contexts"] is not None:
+                    contexts = item["contexts"]
+                result = text
+                break
+            attempts.append(f"[{item['label']}] {self._describe_empty_response(resp)}")
+        else:
+            raise RuntimeError(
+                ("所有调用方式均失败 -> " + " | ".join(attempts))
+                if attempts
+                else "LLM 调用未产生任何结果"
+            )
 
         # 4. 可选：把本轮对话写回会话历史（默认关闭，避免长期污染日常聊天上下文）
         if bool(self.config.get("parse_write_history", False)):
             try:
-                if conv_mgr and cid and history_is_dict:
+                if conv_mgr and cid and history_is_dict and contexts:
                     new_history = list(contexts or [])
                     new_history.append({"role": "user", "content": prompt_text})
                     new_history.append({"role": "assistant", "content": result})
@@ -731,10 +882,13 @@ class MsgPushPlugin(Star):
         formatted = f"[测试]推送\n{text}"
         try:
             if self._mode() == MODE_PARSE:
-                result, fallback = await self._parse_and_push(umo, formatted, [])
+                result, fallback, perr = await self._parse_and_push(
+                    umo, formatted, []
+                )
                 if fallback:
                     yield event.plain_result(
-                        f"解析失败，已降级为原始模式向 '{alias}' 转发。请检查 LLM 配置或查看日志。"
+                        "解析失败，已降级为原始模式转发。原因:\n"
+                        f"{(perr or '未知')[:800]}"
                     )
                 else:
                     yield event.plain_result(

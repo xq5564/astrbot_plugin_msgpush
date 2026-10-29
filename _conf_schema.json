@@ -34,9 +34,9 @@
     "hint": "建议关闭：写回会让 AI 后续把推送当成聊天内容，长期造成上下文污染"
   },
   "parse_max_tokens": {
-    "description": "解析回复的最大 token 数（0 表示不限制）",
+    "description": "解析回复的最大 token 数（0 = 不限制，推荐。推理模型思维链会消耗 token，限制过小会导致正文为空）",
     "type": "int",
-    "default": 600
+    "default": 0
   },
   "parse_fallback_raw": {
     "description": "解析失败时自动降级为原始转发（避免消息丢失）",
